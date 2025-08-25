@@ -1,0 +1,203 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <thread>
+#include <fstream>
+#include <string>
+
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+
+#define LOG_FILE "C:\\temp\\Hamachi_DLL_log.txt"
+#define CONFIG_FILE "C:\\temp\\hamachi_config.txt"
+#define PORT 50007
+
+bool running = true;
+
+// Log to CMD and file
+void Log(const char* msg)
+{
+    std::ofstream log(LOG_FILE, std::ios::app);
+    if (log.is_open()) { log << msg << std::endl; log.close(); }
+
+    DWORD written;
+    WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), msg, (DWORD)strlen(msg), &written, nullptr);
+    WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), "\n", 1, &written, nullptr);
+}
+
+// Get Hamachi IP for host
+bool GetHamachiIP(std::string& ipOut)
+{
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0) return false;
+
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;
+    addrinfo* info = nullptr;
+
+    if (getaddrinfo(hostname, NULL, &hints, &info) != 0) return false;
+
+    for (addrinfo* ptr = info; ptr != nullptr; ptr = ptr->ai_next)
+    {
+        sockaddr_in* addr = (sockaddr_in*)ptr->ai_addr;
+        char ipStr[INET_ADDRSTRLEN] = { 0 };
+
+        if (InetNtopA(AF_INET, &addr->sin_addr, ipStr, INET_ADDRSTRLEN))
+        {
+            std::string ip = ipStr;
+            if (ip.rfind("25.", 0) == 0) // Hamachi IP starts with 25.
+            {
+                ipOut = ip;
+                freeaddrinfo(info);
+                return true;
+            }
+        }
+    }
+
+    freeaddrinfo(info);
+    return false;
+}
+
+// TCP Server (host)
+void TCPServer()
+{
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup failed"); return; }
+
+    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (listenSocket == INVALID_SOCKET) { Log("Socket creation failed"); return; }
+
+    sockaddr_in serverAddr{};
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(PORT);
+
+    if (bind(listenSocket, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
+    {
+        Log("Bind failed"); return;
+    }
+
+    if (listen(listenSocket, 1) == SOCKET_ERROR) { Log("Listen failed"); return; }
+    Log("Server listening...");
+
+    SOCKET client = accept(listenSocket, nullptr, nullptr);
+    if (client != INVALID_SOCKET)
+    {
+        Log("Client connected!");
+        char buffer[256];
+        while (running)
+        {
+            int received = recv(client, buffer, sizeof(buffer) - 1, 0);
+            if (received > 0)
+            {
+                buffer[received] = '\0';
+                Log(buffer);
+            }
+        }
+        closesocket(client);
+    }
+
+    closesocket(listenSocket);
+    WSACleanup();
+}
+
+// TCP Client (friend)
+void TCPClient(const std::string& hostIP)
+{
+    Log("Connecting to host...");
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) { Log("WSAStartup failed"); return; }
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    if (s == INVALID_SOCKET) { Log("Socket creation failed"); return; }
+
+    sockaddr_in server{};
+    server.sin_family = AF_INET;
+    server.sin_port = htons(PORT);
+
+    if (InetPtonA(AF_INET, hostIP.c_str(), &server.sin_addr) != 1)
+    {
+        Log("Invalid host IP."); closesocket(s); WSACleanup(); return;
+    }
+
+    if (connect(s, (sockaddr*)&server, sizeof(server)) == 0)
+    {
+        Log("Connected to host!");
+        send(s, "Hello from client!", 18, 0);
+    }
+    else
+    {
+        Log("Failed to connect to host.");
+    }
+
+    closesocket(s);
+    WSACleanup();
+}
+
+// Read configuration from file
+bool ReadConfig(std::string& mode, std::string& hostIP)
+{
+    std::ifstream cfg(CONFIG_FILE);
+    if (!cfg.is_open()) return false;
+
+    std::string line;
+    while (std::getline(cfg, line))
+    {
+        if (line.find("MODE=") == 0) mode = line.substr(5);
+        else if (line.find("HOST_IP=") == 0) hostIP = line.substr(8);
+    }
+    cfg.close();
+    return true;
+}
+
+// DLL entry point
+BOOL APIENTRY DllMain(HMODULE hModule,
+    DWORD  ul_reason_for_call,
+    LPVOID lpReserved)
+{
+    switch (ul_reason_for_call)
+    {
+    case DLL_PROCESS_ATTACH:
+    {
+        CreateDirectoryA("C:\\temp", nullptr);
+        Log("DLL Injected Successfully! (All-in-One)");
+
+        std::string mode;
+        std::string hostIP;
+
+        if (!ReadConfig(mode, hostIP))
+        {
+            Log("Failed to read config.txt. Defaulting to CLIENT mode.");
+            mode = "CLIENT";
+        }
+
+        if (mode == "HOST")
+        {
+            if (hostIP.empty())
+            {
+                if (GetHamachiIP(hostIP))
+                    Log(("Detected Hamachi IP: " + hostIP).c_str());
+                else
+                    Log("Could not detect Hamachi IP!");
+            }
+            std::thread(TCPServer).detach();
+        }
+        else if (mode == "CLIENT")
+        {
+            if (hostIP.empty())
+                Log("CLIENT mode requires HOST_IP in config.txt");
+            else
+                std::thread([hostIP]() { TCPClient(hostIP); }).detach();
+        }
+        break;
+    }
+    case DLL_THREAD_ATTACH:
+    case DLL_THREAD_DETACH:
+    case DLL_PROCESS_DETACH:
+        running = false;
+        break;
+    }
+    return TRUE;
+}
